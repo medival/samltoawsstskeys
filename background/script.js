@@ -8,18 +8,20 @@ let FileName = 'credentials';
 let ApplySessionDuration = true;
 let CustomSessionDuration = 3600;
 let DebugLogs = false;
+let CustomUrls = [];
 let RoleArns = {};
 let LF = '\n';
 
 // When this background process starts, load variables from chrome storage 
-// from saved Extension Options
-loadItemsFromStorage();
-// Additionaly on start of the background process it is checked if this extension can be activated
-chrome.storage.sync.get({
-  // The default is activated
-  Activated: true
-}, function(item) {
-  if (item.Activated) addOnBeforeRequestEventListener();
+// from saved Extension Options, then setup listener
+loadItemsFromStorage(function() {
+  // After loading storage, check if extension should be activated
+  chrome.storage.sync.get({
+    // The default is activated
+    Activated: true
+  }, function(item) {
+    if (item.Activated) addOnBeforeRequestEventListener();
+  });
 });
 // Additionally on start of the background process it is checked if a new version of the plugin is installed.
 // If so, show the user the changelog
@@ -36,18 +38,33 @@ keepServiceRunning();
 
 
 // Function to be called when this extension is activated.
-// This adds an EventListener for each request to signin.aws.amazon.com
+// This adds an EventListener for each request to signin.aws.amazon.com and custom URLs
 function addOnBeforeRequestEventListener() {
-  if (DebugLogs) console.log('DEBUG: Extension is activated');
+  console.log('INFO: Extension is being activated');
   if (chrome.webRequest.onBeforeRequest.hasListener(onBeforeRequestEvent)) {
     console.log("ERROR: onBeforeRequest EventListener could not be added, because onBeforeRequest already has an EventListener.");
   } else {
+    // Build URL list: default AWS URL + custom URLs
+    let urlsToMonitor = ["https://signin.aws.amazon.com/saml"];
+    if (CustomUrls && CustomUrls.length > 0) {
+      console.log('INFO: Adding ' + CustomUrls.length + ' custom URL(s)');
+      // Add custom URLs, ensuring they have wildcard patterns for flexibility
+      CustomUrls.forEach(url => {
+        // Remove trailing slash if present
+        url = url.replace(/\/$/, '');
+        // Add both exact match and wildcard pattern
+        urlsToMonitor.push(url);
+        urlsToMonitor.push(url + "/*");
+      });
+    }
+    console.log('INFO: Monitoring URLs:');
+    console.log(urlsToMonitor);
     chrome.webRequest.onBeforeRequest.addListener(
       onBeforeRequestEvent,
-      { urls: ["https://signin.aws.amazon.com/saml"] },
+      { urls: urlsToMonitor },
       ["requestBody"]
     );
-    if (DebugLogs) console.log('DEBUG: onBeforeRequest Listener added');
+    console.log('INFO: onBeforeRequest Listener added successfully');
   }
 }
 
@@ -201,7 +218,7 @@ async function onBeforeRequestEvent(details) {
     keys = await assumeRoleWithSAML(attributes_role, SAMLAssertion, sessionduration);
     // Append AWS credentials keys as string to 'credentials' variable
     credentials = addProfileToCredentials(credentials, "default", keys.access_key_id, 
-      keys.secret_access_key, keys.session_token)
+      keys.secret_access_key, keys.session_token, keys.region)
   }
   catch(err) {
     console.log("ERROR: Error when trying to assume the IAM Role with the SAML Assertion.");
@@ -223,7 +240,7 @@ async function onBeforeRequestEvent(details) {
           keys.secret_access_key, keys.session_token, sessionduration);
         // Append AWS credentials keys as string to 'credentials' variable
         credentials = addProfileToCredentials(credentials, profileList[i], result.access_key_id,
-          result.secret_access_key, result.session_token);
+          result.secret_access_key, result.session_token, result.region);
       }
       catch(err) {
         console.log("ERROR: Error when trying to assume additional IAM Role.");
@@ -245,13 +262,26 @@ async function onBeforeRequestEvent(details) {
 // from this argument and uses it to call the AWS STS assumeRoleWithSAML API.
 // Takes the SAMLAssertion as a second argument which is needed as authentication for the STS API.
 async function assumeRoleWithSAML(roleClaimValue, SAMLAssertion, SessionDuration) {
-  // Pattern for Role
-  let reRole = /arn:aws:iam:[^:]*:[0-9]+:role\/[^,]+/i;
-  // Patern for Principal (SAML Provider)
-  let rePrincipal = /arn:aws:iam:[^:]*:[0-9]+:saml-provider\/[^,]+/i;
+  // Pattern for Role - supports both standard AWS (arn:aws:) and China (arn:aws-cn:)
+  let reRole = /arn:aws(-cn|-us-gov)?:iam:[^:]*:[0-9]+:role\/[^,]+/i;
+  // Pattern for Principal (SAML Provider) - supports both standard AWS and China
+  let rePrincipal = /arn:aws(-cn|-us-gov)?:iam:[^:]*:[0-9]+:saml-provider\/[^,]+/i;
+  
+  console.log('INFO: Extracting ARNs from roleClaimValue:', roleClaimValue);
+  
   // Extract both regex patterns from the roleClaimValue (which is a SAMLAssertion attribute)
-  RoleArn = roleClaimValue.match(reRole)[0];
-  PrincipalArn = roleClaimValue.match(rePrincipal)[0];
+  let roleMatch = roleClaimValue.match(reRole);
+  let principalMatch = roleClaimValue.match(rePrincipal);
+  
+  if (!roleMatch || !principalMatch) {
+    console.log('ERROR: Failed to extract ARNs from roleClaimValue');
+    console.log('roleMatch:', roleMatch);
+    console.log('principalMatch:', principalMatch);
+    throw new Error('Failed to extract Role ARN or Principal ARN from SAML assertion');
+  }
+  
+  RoleArn = roleMatch[0];
+  PrincipalArn = principalMatch[0];
   
   if (DebugLogs) {
     console.log('RoleArn: ' + RoleArn);
@@ -270,10 +300,36 @@ async function assumeRoleWithSAML(roleClaimValue, SAMLAssertion, SessionDuration
 
   // AWS SDK is a module exorted from a webpack packaged lib
   // See 'library.name' in webpack.config.js
-  let clientconfig = {
-    region: 'us-east-1', // region is mandatory to specify, but ignored when using global endpoint
-    useGlobalEndpoint: true
+  
+  // Detect partition and region from ARN
+  let partition = 'aws'; // default
+  let region = 'us-east-1'; // default
+  let endpoint = undefined;
+  
+  if (RoleArn.includes('arn:aws-cn:')) {
+    partition = 'aws-cn';
+    region = 'cn-north-1'; // AWS China default region
+    endpoint = 'https://sts.cn-north-1.amazonaws.com.cn';
+    console.log('INFO: Detected AWS China partition, using China STS endpoint');
+  } else if (RoleArn.includes('arn:aws-us-gov:')) {
+    partition = 'aws-us-gov';
+    region = 'us-gov-west-1';
+    endpoint = 'https://sts.us-gov-west-1.amazonaws.com';
+    console.log('INFO: Detected AWS GovCloud partition');
   }
+  
+  let clientconfig = {
+    region: region
+  };
+  
+  // For China and GovCloud, use specific endpoint. For standard AWS, use global endpoint
+  if (endpoint) {
+    clientconfig.endpoint = endpoint;
+    console.log('INFO: Using STS endpoint:', endpoint);
+  } else {
+    clientconfig.useGlobalEndpoint = true;
+  }
+  
   const client = new webpacksts.AWSSTSClient(clientconfig);
   const command = new webpacksts.AWSAssumeRoleWithSAMLCommand(params);
 
@@ -285,6 +341,7 @@ async function assumeRoleWithSAML(roleClaimValue, SAMLAssertion, SessionDuration
       access_key_id: response.Credentials.AccessKeyId,
       secret_access_key: response.Credentials.SecretAccessKey,
       session_token: response.Credentials.SessionToken,
+      region: region  // Include the detected region
     }
     if (DebugLogs) {
       console.log('DEBUG: AssumeRoleWithSAML response:');
@@ -303,13 +360,34 @@ async function assumeRoleWithSAML(roleClaimValue, SAMLAssertion, SessionDuration
 // (which where fetched using SAML) as authentication.
 async function assumeRole(roleArn, roleSessionName, AccessKeyId, SecretAccessKey,
   SessionToken, SessionDuration) {
+  
+  // Detect partition and region from ARN
+  let region = 'us-east-1'; // default
+  let endpoint = undefined;
+  
+  if (roleArn.includes('arn:aws-cn:')) {
+    region = 'cn-north-1';
+    endpoint = 'https://sts.cn-north-1.amazonaws.com.cn';
+    console.log('INFO: Detected AWS China partition for assumeRole');
+  } else if (roleArn.includes('arn:aws-us-gov:')) {
+    region = 'us-gov-west-1';
+    endpoint = 'https://sts.us-gov-west-1.amazonaws.com';
+    console.log('INFO: Detected AWS GovCloud partition for assumeRole');
+  }
+  
   // Set the fetched STS keys from the SAML response as credentials for doing the API call
   let clientconfig = {
-    region: 'us-east-1', // region is mandatory to specify, but ignored when using global endpoint
-    useGlobalEndpoint: true,
+    region: region,
     credentials: {
       accessKeyId: AccessKeyId, secretAccessKey: SecretAccessKey, sessionToken: SessionToken
     }
+  };
+  
+  // For China and GovCloud, use specific endpoint. For standard AWS, use global endpoint
+  if (endpoint) {
+    clientconfig.endpoint = endpoint;
+  } else {
+    clientconfig.useGlobalEndpoint = true;
   }
   // AWS SDK is a module exorted from a webpack packaged lib
   // See 'library.name' in webpack.config.js
@@ -332,6 +410,7 @@ async function assumeRole(roleArn, roleSessionName, AccessKeyId, SecretAccessKey
       access_key_id: response.Credentials.AccessKeyId,
       secret_access_key: response.Credentials.SecretAccessKey,
       session_token: response.Credentials.SessionToken,
+      region: region  // Include the detected region
     }
     if (DebugLogs) {
       console.log('DEBUG: assumeRole response:');
@@ -347,9 +426,15 @@ async function assumeRole(roleArn, roleSessionName, AccessKeyId, SecretAccessKey
 
 
 // Append AWS credentials profile to the existing content of a credentials file
-function addProfileToCredentials(credentials, profileName, AccessKeyId, SecretAcessKey, SessionToken) {
-  credentials += "[" + profileName + "]" + LF +
-  "aws_access_key_id=" + AccessKeyId + LF +
+function addProfileToCredentials(credentials, profileName, AccessKeyId, SecretAcessKey, SessionToken, region) {
+  credentials += "[" + profileName + "]" + LF;
+  
+  // Add region first if provided (especially important for China region)
+  if (region) {
+    credentials += "aws_region=" + region + LF;
+  }
+  
+  credentials += "aws_access_key_id=" + AccessKeyId + LF +
   "aws_secret_access_key=" + SecretAcessKey + LF +
   "aws_session_token=" + SessionToken + LF +
   LF;
@@ -384,8 +469,19 @@ chrome.runtime.onMessage.addListener(
     // When the options are changed in the Options panel
     // these items need to be reloaded in this background process.
     if (request.action == "reloadStorageItems") {
-      loadItemsFromStorage();
-      sendResponse({ message: "Storage items reloaded in background process." });
+      // Remove old listener first
+      removeOnBeforeRequestEventListener();
+      // Reload storage items
+      loadItemsFromStorage(function() {
+        // Re-add listener with new URLs
+        chrome.storage.sync.get({ Activated: true }, function(item) {
+          if (item.Activated) {
+            addOnBeforeRequestEventListener();
+          }
+        });
+        sendResponse({ message: "Storage items reloaded and listener updated in background process." });
+      });
+      return true; // Keep message channel open for async response
     }
     // When the activation checkbox on the popup screen is checked/unchecked
     // the webRequest event listener needs to be added or removed.
@@ -411,13 +507,14 @@ function keepServiceRunning() {
   
   
 
-function loadItemsFromStorage() {
+function loadItemsFromStorage(callback) {
   //default values for the options
   chrome.storage.sync.get({
     FileName: 'credentials',
     ApplySessionDuration: 'yes',
     CustomSessionDuration: '3600',
     DebugLogs: 'no',
+    CustomUrls: [],
     RoleArns: {}
   }, function (items) {
     FileName = items.FileName;
@@ -432,6 +529,13 @@ function loadItemsFromStorage() {
     } else {
       DebugLogs = true;
     }
+    CustomUrls = items.CustomUrls || [];
     RoleArns = items.RoleArns;
+    if (DebugLogs) {
+      console.log('DEBUG: Loaded CustomUrls from storage:');
+      console.log(CustomUrls);
+    }
+    // Call callback if provided
+    if (callback) callback();
   });
 }

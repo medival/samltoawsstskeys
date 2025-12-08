@@ -47,6 +47,13 @@
       </select>
     </div>
     
+    <div id="divCustomUrls" class="setting-part"></div>
+      <label>[OPTIONAL]</label><br>
+      <label>Specify custom SAML URLs to monitor (e.g., https://signin.amazonaws.cn/saml). Leave empty to use default AWS signin URL only.</label>
+      <div id="custom_urls" class="inline-div"></div>
+      </div>
+    </div>
+
     <div id="divRoles" class="setting-part">
       <label>[OPTIONAL]</label><br>
       <label>Specify a list of Role ARN's. For each role the plugin will call the assume-role API. The fetched AWS STS keys will be added to the output file as separate profiles.</label>

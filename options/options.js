@@ -12,6 +12,15 @@ function save_options() {
   // Is DEBUG log enabled?
   var DebugLogs = $("#DebugLogs option:selected").val();
 
+  // Get the custom SAML URLs entered by the user
+  var CustomUrls = [];
+  $("input[id^='url_']").each(function (index) {
+    var url = $(this).val().trim();
+    if (url != '') {
+      CustomUrls.push(url);
+    }
+  });
+
   // Get the Role_ARN's (Profile/ARNs pairs) entered by the user in the table
   var RoleArns = {};
   // Iterate over all added profiles in the list
@@ -31,6 +40,7 @@ function save_options() {
     ApplySessionDuration: ApplySessionDuration,
     CustomSessionDuration: CustomSessionDuration,
     DebugLogs: DebugLogs,
+    CustomUrls: CustomUrls,
     RoleArns: RoleArns
   }, function () {
     // Show 'Options saved' message to let user know options were saved.
@@ -55,6 +65,7 @@ function restore_options() {
     ApplySessionDuration: 'yes',
     CustomSessionDuration: '3600',
     DebugLogs: 'no',
+    CustomUrls: [],
     RoleArns: {}
   }, function (items) {
     // Set filename
@@ -65,6 +76,16 @@ function restore_options() {
     $("#SessionDuration").val(items.ApplySessionDuration);
     // Set DebugLogs
     $("#DebugLogs").val(items.DebugLogs);
+    // Set the html for the Custom URLs Table
+    $("#custom_urls").html('<table><tr id="tr_url_header"><th>Custom SAML URL</th><th></th><th></th></tr></table>');
+    // For each custom URL add table row
+    for (var i = 0; i < items.CustomUrls.length; i++) {
+      addUrlTableRow('#tr_url_header', items.CustomUrls[i]);
+    }
+    // Add a blank table row if there are no current entries
+    if (items.CustomUrls.length == 0) {
+      addUrlTableRow('#custom_urls table tr:last', null);
+    }
     // Set the html for the Role ARN's Table
     $("#role_arns").html('<table><tr id="tr_header"><th>Profile</th><th>ARN of the role</th><th></th><th></th></tr></table>');
     // For each profile/ARN pair add table row (showing the profile-name and ARN)
@@ -121,6 +142,30 @@ function getTableRowHtml(tableRowId, profile, arn) {
 
 function randomId() {
   return Math.random().toString(36).substr(2, 8);
+}
+
+// Add a blank table row for custom URLs
+function addUrlTableRow(previousRowJquerySelector, url) {
+  var newRowId = randomId();
+  $(previousRowJquerySelector).after(getUrlTableRowHtml(newRowId, url));
+  $('#btn_url_add_' + newRowId).on("click", function () {
+    addUrlTableRow('#tr_url_' + newRowId, null);
+  });
+  $('#btn_url_del_' + newRowId).on("click", function () {
+    delTableRow('#tr_url_' + newRowId);
+  });
+}
+
+// Generate HTML for a table row of the custom_urls table
+function getUrlTableRowHtml(tableRowId, url) {
+  var urlValue = '';
+  if (url) { urlValue = 'value="' + url + '"' };
+  var html = '<tr id="tr_url_' + tableRowId + '">\
+          <th><input type="text" id="url_' + tableRowId + '" size="60" placeholder="https://signin.amazonaws.cn/saml" ' + urlValue + '></th> \
+          <th><button id="btn_url_del_' + tableRowId + '">DEL</button></th> \
+          <th><button id="btn_url_add_' + tableRowId + '">ADD</button></th> \
+          </tr>';
+  return html;
 }
 
 function showCustomSessionDurationDiv() {
